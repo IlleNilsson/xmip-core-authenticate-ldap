@@ -1,12 +1,6 @@
 # xmip-core-authenticate-ldap
 
-Authenticate by ldap: verifies a bind at the directory with the presented credential. A technology of
-[xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
-
-Declared and not yet written; `architecture.toml` carries the maturity. When
-it is written it implements `Authenticator`, one mechanism at one gate (ADR-0050).
-What it may depend on is `repository-model.md` section 4 and ADR-0044: its
-capability, and no sibling.
+Authenticate by LDAP: proves a username and password by a simple bind at the directory, RFC 4511 over TCP. A technology of [xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
 
 ## Toolchain
 
