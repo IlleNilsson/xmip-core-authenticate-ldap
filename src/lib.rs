@@ -22,6 +22,11 @@
 //! directory over a protected path. The mechanism keeps its own name,
 //! `ldap`, so an Acceptance can say which verifier a Location uses
 //! (ADR-0050, amendment 2026-09-16).
+//!
+//! A directory that binds by user principal name, as Active Directory does,
+//! is named with [`LdapAuthenticator::binding_by_principal`]: the bind name
+//! is then the name itself, read and written by the identify capability's
+//! `UserPrincipalName` and never parsed here (ADR-0054).
 
 pub mod ber;
 pub mod bind;
@@ -30,6 +35,7 @@ pub use bind::{BindRequest, BindResponse};
 
 use authenticate::{AuthenticateError, Authenticator, Presented};
 use context::Verified;
+use identify::UserPrincipalName;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -73,8 +79,18 @@ pub fn escape(value: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct LdapAuthenticator {
     endpoint: String,
-    template: String,
+    naming: Naming,
     timeout: Duration,
+}
+
+/// How the presented name becomes the name the bind is made as.
+#[derive(Clone, Debug)]
+enum Naming {
+    /// Written into a DN template, in place of `{username}`.
+    Template(String),
+    /// The user principal name itself, a bare user being looked up in the
+    /// default domain where one is configured.
+    Principal(Option<String>),
 }
 
 impl LdapAuthenticator {
@@ -97,9 +113,22 @@ impl LdapAuthenticator {
         }
         Ok(Self {
             endpoint: endpoint.into(),
-            template,
+            naming: Naming::Template(template),
             timeout: DEFAULT_TIMEOUT,
         })
+    }
+
+    /// Binds at `endpoint` with the user principal name itself as the bind
+    /// name, which Active Directory takes in a simple bind. `PARTNERX\jane`
+    /// and `jane@partnerx` bind alike as `jane@partnerx`, and a bare `jane`
+    /// is looked up in `default_domain` where one is given.
+    #[must_use]
+    pub fn binding_by_principal(endpoint: impl Into<String>, default_domain: Option<&str>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            naming: Naming::Principal(default_domain.map(str::to_string)),
+            timeout: DEFAULT_TIMEOUT,
+        }
     }
 
     /// How long the directory is given to connect, and again to answer.
@@ -115,10 +144,63 @@ impl LdapAuthenticator {
         &self.endpoint
     }
 
-    /// The DN `username` binds as.
-    #[must_use]
-    pub fn distinguished_name(&self, username: &str) -> String {
-        self.template.replace(PLACEHOLDER, &escape(username))
+    /// The account `username` names, where it is a user principal name or
+    /// the default domain makes it one.
+    fn principal(&self, username: &str) -> Option<UserPrincipalName> {
+        UserPrincipalName::parse(username).or_else(|| match &self.naming {
+            Naming::Principal(Some(domain)) => UserPrincipalName::of(username, domain),
+            _ => None,
+        })
+    }
+
+    /// Refuse a claim whose `principal.user` evidence names another account
+    /// than the one it presents. Evidence is never proof: agreeing with it
+    /// proves nothing, and the bind still decides.
+    fn same_account(&self, presented: &Presented) -> Result<(), AuthenticateError> {
+        let claimed = presented
+            .evidence
+            .iter()
+            .find(|(name, _)| name == identify::principal::USER)
+            .and_then(|(_, value)| UserPrincipalName::parse(value));
+        match (claimed, self.principal(&presented.value)) {
+            (Some(claimed), Some(read)) if !claimed.is(&read) => {
+                Err(AuthenticateError::new(format!(
+                    "the claim presents '{read}' and its evidence names '{claimed}': not the \
+                     same account"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The name `username` binds as: the DN the template makes of it, or
+    /// its user principal name in canonical form.
+    ///
+    /// # Errors
+    ///
+    /// This binds by principal, and `username` is not a user principal name
+    /// and no default domain makes it one.
+    pub fn bind_name(&self, username: &str) -> Result<String, AuthenticateError> {
+        let domain = match &self.naming {
+            Naming::Template(template) => {
+                return Ok(template.replace(PLACEHOLDER, &escape(username)));
+            }
+            Naming::Principal(domain) => domain.as_deref(),
+        };
+        self.principal(username)
+            .map(|principal| principal.to_string())
+            .ok_or_else(|| {
+                AuthenticateError::new(match domain {
+                    Some(domain) => format!(
+                        "'{username}' is not a user principal name, nor a user in the default \
+                         domain '{domain}'"
+                    ),
+                    None => format!(
+                        "'{username}' is not a user principal name and no default domain is \
+                         configured: the directory binds by principal"
+                    ),
+                })
+            })
     }
 
     fn unreachable(&self, failure: &dyn std::fmt::Display) -> AuthenticateError {
@@ -212,7 +294,9 @@ impl Authenticator for LdapAuthenticator {
                 "the password presented is empty, and a bind without one proves nothing",
             ));
         }
-        let response = self.bind(&self.distinguished_name(&presented.value), password)?;
+        let name = self.bind_name(&presented.value)?;
+        self.same_account(presented)?;
+        let response = self.bind(&name, password)?;
         match response.result_code {
             bind::SUCCESS => Ok(Verified::Proven),
             bind::INVALID_CREDENTIALS | bind::NO_SUCH_OBJECT => Ok(Verified::Refused),
@@ -249,7 +333,7 @@ mod tests {
     fn answer(request: &BindRequest) -> BindResponse {
         let id = request.message_id;
         match (request.name.as_str(), request.password.as_str()) {
-            ("uid=alice,ou=people,dc=example,dc=org", "pencil")
+            ("uid=alice,ou=people,dc=example,dc=org" | "jane@partnerx", "pencil")
             | ("uid=Smith\\, John,ou=people,dc=example,dc=org", "pen") => {
                 BindResponse::answering(id, bind::SUCCESS)
             }
@@ -331,6 +415,47 @@ mod tests {
         assert_eq!(
             directory.finish(),
             ["uid=alice,ou=people,dc=example,dc=org"; 2]
+        );
+    }
+
+    #[test]
+    fn each_spelling_of_one_account_binds_by_the_same_user_principal_name() {
+        let directory = directory(3);
+        let verifier =
+            LdapAuthenticator::binding_by_principal(&directory.endpoint, Some("PartnerX"))
+                .with_timeout(Duration::from_secs(2));
+        for name in ["PARTNERX\\jane", "jane@PartnerX", "jane"] {
+            let filed = claim(name, "pencil").with_evidence(identify::principal::USER, name);
+            assert_eq!(
+                verifier.verify(&filed).expect("verified"),
+                Verified::Proven,
+                "{name}"
+            );
+        }
+        assert_eq!(directory.finish(), ["jane@partnerx"; 3]);
+    }
+
+    #[test]
+    fn a_bare_name_without_a_default_domain_and_evidence_of_another_account_are_refused() {
+        // No directory stands here: nothing may be sent for either claim.
+        let verifier = LdapAuthenticator::binding_by_principal("127.0.0.1:9", None);
+        let bare = verifier
+            .verify(&claim("jane", "pencil"))
+            .expect_err("refused");
+        assert!(
+            bare.message.contains("'jane' is not a user principal name")
+                && bare.message.contains("no default domain"),
+            "{}",
+            bare.message
+        );
+        let filed = claim("PARTNERX\\jane", "pencil")
+            .with_evidence(identify::principal::USER, "mallory@partnerx");
+        let other = verifier.verify(&filed).expect_err("refused");
+        assert!(
+            other.message.contains("'jane@partnerx'")
+                && other.message.contains("'mallory@partnerx'"),
+            "{}",
+            other.message
         );
     }
 
