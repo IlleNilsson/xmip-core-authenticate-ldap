@@ -23,6 +23,8 @@ authenticate = { package = "xmip-core-authenticate", git = "https://github.com/I
 identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilsson/xmip-core-identify", branch = "main" }
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
+# X.690: a bind is BER, read and written with the estate's one reader.
+asn1 = { package = "xmip-core-asn1", git = "https://github.com/IlleNilsson/xmip-core-asn1", branch = "main" }
 
 [lints.rust]
 unsafe_code = "forbid"
