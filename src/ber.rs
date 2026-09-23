@@ -1,7 +1,7 @@
 //! What a bind takes of X.690: definite lengths, small integers, and one
 //! element read off a stream no larger than a bind response honestly is.
 //!
-//! The reader is the estate's one, `xmip-core-asn1`; this carried its own
+//! The reader is the estate's one, `xmip-core-library-asn1`; this carried its own
 //! until 2026-09-22, when the manifest also came to say so.
 
 use authenticate::AuthenticateError;
