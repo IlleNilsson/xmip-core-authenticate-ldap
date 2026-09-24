@@ -12,9 +12,10 @@
 //! Both directions of both messages are here, because the far end a test
 //! stands up reads the request and writes the response.
 
-use crate::ber;
+use asn1::{ENUMERATED, INTEGER, OCTET_STRING, SEQUENCE, expect, integer, read_integer, tlv};
 use authenticate::AuthenticateError;
 use std::fmt;
+use std::io::Read;
 
 /// `[APPLICATION 0]`, constructed: a `BindRequest`.
 pub const BIND_REQUEST: u8 = 0x60;
@@ -32,13 +33,30 @@ pub const NO_SUCH_OBJECT: i64 = 32;
 /// `invalidCredentials`: the name or the password is wrong.
 pub const INVALID_CREDENTIALS: i64 = 49;
 
+/// The largest message this reads off a stream. A bind response is a few
+/// dozen bytes; a directory that sends more than this is not answering a
+/// bind.
+pub const LARGEST: usize = 64 * 1024;
+
+/// One whole `LDAPMessage` off a stream, tag and length included.
+///
+/// # Errors
+///
+/// The stream ends or fails first, or the message is larger than
+/// [`LARGEST`].
+pub fn read_message(stream: &mut impl Read) -> Result<Vec<u8>, AuthenticateError> {
+    asn1::read_element(stream, LARGEST).map_err(|failure| {
+        AuthenticateError::new(format!("the directory's answer: {}", failure.message))
+    })
+}
+
 /// An `UnbindRequest` under `message_id`: `[APPLICATION 2]` NULL, which a
 /// client sends before it closes and a directory does not answer.
 #[must_use]
 pub fn unbind(message_id: i64) -> Vec<u8> {
-    let mut contents = ber::integer(ber::INTEGER, message_id);
+    let mut contents = tlv(INTEGER, &integer(message_id));
     contents.extend_from_slice(&[0x42, 0x00]);
-    ber::tlv(ber::SEQUENCE, &contents)
+    tlv(SEQUENCE, &contents)
 }
 
 /// What RFC 4511 appendix A calls a result code, for the ones a bind meets.
@@ -71,10 +89,10 @@ fn text(contents: &[u8], what: &str) -> Result<String, AuthenticateError> {
 
 /// The envelope: the message id, then the operation under `operation`.
 fn open(message: &[u8], operation: u8) -> Result<(i64, &[u8]), AuthenticateError> {
-    let (envelope, _) = ber::expect(message, ber::SEQUENCE)?;
-    let (id, rest) = ber::expect(envelope, ber::INTEGER)?;
-    let (body, _) = ber::expect(rest, operation)?;
-    Ok((ber::read_integer(id)?, body))
+    let (envelope, _) = expect(message, SEQUENCE)?;
+    let (id, rest) = expect(envelope, INTEGER)?;
+    let (body, _) = expect(rest, operation)?;
+    Ok((read_integer(id)?, body))
 }
 
 /// A simple bind: a DN and its password.
@@ -102,12 +120,12 @@ impl BindRequest {
     /// The `LDAPMessage` carrying this bind.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bind = ber::integer(ber::INTEGER, VERSION);
-        bind.extend_from_slice(&ber::tlv(ber::OCTET_STRING, self.name.as_bytes()));
-        bind.extend_from_slice(&ber::tlv(SIMPLE, self.password.as_bytes()));
-        let mut contents = ber::integer(ber::INTEGER, self.message_id);
-        contents.extend_from_slice(&ber::tlv(BIND_REQUEST, &bind));
-        ber::tlv(ber::SEQUENCE, &contents)
+        let mut bind = tlv(INTEGER, &integer(VERSION));
+        bind.extend_from_slice(&tlv(OCTET_STRING, self.name.as_bytes()));
+        bind.extend_from_slice(&tlv(SIMPLE, self.password.as_bytes()));
+        let mut contents = tlv(INTEGER, &integer(self.message_id));
+        contents.extend_from_slice(&tlv(BIND_REQUEST, &bind));
+        tlv(SEQUENCE, &contents)
     }
 
     /// Read an `LDAPMessage` as a simple bind, as a directory does.
@@ -117,15 +135,15 @@ impl BindRequest {
     /// Not a bind request, not version 3, or not a simple bind.
     pub fn decode(message: &[u8]) -> Result<Self, AuthenticateError> {
         let (message_id, body) = open(message, BIND_REQUEST)?;
-        let (version, rest) = ber::expect(body, ber::INTEGER)?;
-        let version = ber::read_integer(version)?;
+        let (version, rest) = expect(body, INTEGER)?;
+        let version = read_integer(version)?;
         if version != VERSION {
             return Err(AuthenticateError::new(format!(
                 "the bind asks for LDAP version {version} and this speaks {VERSION}"
             )));
         }
-        let (name, rest) = ber::expect(rest, ber::OCTET_STRING)?;
-        let (password, _) = ber::expect(rest, SIMPLE)?;
+        let (name, rest) = expect(rest, OCTET_STRING)?;
+        let (password, _) = expect(rest, SIMPLE)?;
         Ok(Self {
             message_id,
             name: text(name, "name")?,
@@ -169,12 +187,12 @@ impl BindResponse {
     /// The `LDAPMessage` carrying this response, as a directory writes it.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut result = ber::integer(ber::ENUMERATED, self.result_code);
-        result.extend_from_slice(&ber::tlv(ber::OCTET_STRING, self.matched_dn.as_bytes()));
-        result.extend_from_slice(&ber::tlv(ber::OCTET_STRING, self.diagnostic.as_bytes()));
-        let mut contents = ber::integer(ber::INTEGER, self.message_id);
-        contents.extend_from_slice(&ber::tlv(BIND_RESPONSE, &result));
-        ber::tlv(ber::SEQUENCE, &contents)
+        let mut result = tlv(ENUMERATED, &integer(self.result_code));
+        result.extend_from_slice(&tlv(OCTET_STRING, self.matched_dn.as_bytes()));
+        result.extend_from_slice(&tlv(OCTET_STRING, self.diagnostic.as_bytes()));
+        let mut contents = tlv(INTEGER, &integer(self.message_id));
+        contents.extend_from_slice(&tlv(BIND_RESPONSE, &result));
+        tlv(SEQUENCE, &contents)
     }
 
     /// Read an `LDAPMessage` as a bind response. Referrals and SASL
@@ -185,12 +203,12 @@ impl BindResponse {
     /// Not a bind response, or one cut short.
     pub fn decode(message: &[u8]) -> Result<Self, AuthenticateError> {
         let (message_id, body) = open(message, BIND_RESPONSE)?;
-        let (code, rest) = ber::expect(body, ber::ENUMERATED)?;
-        let (matched_dn, rest) = ber::expect(rest, ber::OCTET_STRING)?;
-        let (diagnostic, _) = ber::expect(rest, ber::OCTET_STRING)?;
+        let (code, rest) = expect(body, ENUMERATED)?;
+        let (matched_dn, rest) = expect(rest, OCTET_STRING)?;
+        let (diagnostic, _) = expect(rest, OCTET_STRING)?;
         Ok(Self {
             message_id,
-            result_code: ber::read_integer(code)?,
+            result_code: read_integer(code)?,
             matched_dn: text(matched_dn, "matched DN")?,
             diagnostic: text(diagnostic, "diagnostic message")?,
         })
@@ -200,6 +218,18 @@ impl BindResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_larger_than_a_bind_response_is_refused_saying_whose() {
+        let mut huge: &[u8] = &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff];
+        let failure = read_message(&mut huge).expect_err("refused");
+        assert!(
+            failure.message.starts_with("the directory's answer: "),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("65536"), "{}", failure.message);
+    }
 
     #[test]
     fn a_bind_request_is_rfc_4511s_byte_for_byte_and_reads_back() {

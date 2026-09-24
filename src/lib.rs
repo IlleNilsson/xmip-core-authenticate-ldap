@@ -28,7 +28,6 @@
 //! is then the name itself, read and written by the identify capability's
 //! `UserPrincipalName` and never parsed here (ADR-0054).
 
-pub mod ber;
 pub mod bind;
 
 pub use bind::{BindRequest, BindResponse};
@@ -36,13 +35,11 @@ pub use bind::{BindRequest, BindResponse};
 use authenticate::{AuthenticateError, Authenticator, Presented};
 use context::Verified;
 use identify::UserPrincipalName;
+use identify::evidence::{self, PASSWORD};
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 use xcore::{Mechanism, mechanism};
-
-/// The proof name this verifier reads off a `Presented`.
-pub const PROOF: &str = "password";
 
 /// Where the username goes in a DN template.
 pub const PLACEHOLDER: &str = "{username}";
@@ -160,7 +157,7 @@ impl LdapAuthenticator {
         let claimed = presented
             .evidence
             .iter()
-            .find(|(name, _)| name == identify::principal::USER)
+            .find(|(name, _)| name == evidence::PRINCIPAL_USER)
             .and_then(|(_, value)| UserPrincipalName::parse(value));
         match (claimed, self.principal(&presented.value)) {
             (Some(claimed), Some(read)) if !claimed.is(&read) => {
@@ -247,7 +244,7 @@ impl LdapAuthenticator {
         stream
             .write_all(&request.encode())
             .map_err(|failure| self.unreachable(&failure))?;
-        let response = BindResponse::decode(&ber::read_element(&mut stream)?)?;
+        let response = BindResponse::decode(&bind::read_message(&mut stream)?)?;
         // A directory does not answer an unbind, and one that has already
         // hung up has lost nothing.
         let _ = stream.write_all(&bind::unbind(MESSAGE_ID + 1));
@@ -280,9 +277,9 @@ impl Authenticator for LdapAuthenticator {
                 presented.mechanism.name()
             )));
         }
-        let password = presented.proof(PROOF).ok_or_else(|| {
+        let password = presented.proof(evidence::PASSWORD).ok_or_else(|| {
             AuthenticateError::new(format!(
-                "no '{PROOF}' proof was presented with the username '{}'",
+                "no '{PASSWORD}' proof was presented with the username '{}'",
                 presented.value
             ))
         })?;
@@ -358,7 +355,7 @@ mod tests {
         let serving = thread::spawn(move || {
             for _ in 0..binds {
                 let (mut stream, _) = listener.accept().expect("a client");
-                let wire = ber::read_element(&mut stream).expect("a message");
+                let wire = bind::read_message(&mut stream).expect("a message");
                 let request = BindRequest::decode(&wire).expect("a bind");
                 record
                     .lock()
@@ -368,7 +365,7 @@ mod tests {
                     .write_all(&answer(&request).encode())
                     .expect("answered");
                 // The client unbinds before it closes.
-                let farewell = ber::read_element(&mut stream).expect("an unbind");
+                let farewell = bind::read_message(&mut stream).expect("an unbind");
                 assert_eq!(farewell, bind::unbind(request.message_id + 1));
             }
         });
@@ -394,7 +391,7 @@ mod tests {
     }
 
     fn claim(username: &str, password: &str) -> Presented {
-        Presented::passed(mechanism::username(), username).with_proof(PROOF, password)
+        Presented::passed(mechanism::username(), username).with_proof(evidence::PASSWORD, password)
     }
 
     #[test]
@@ -408,7 +405,8 @@ mod tests {
             Verified::Proven
         );
         // A claim the first gate already filed under this mechanism reads too.
-        let filed = Presented::passed(mechanism::ldap(), "alice").with_proof(PROOF, "pencil");
+        let filed =
+            Presented::passed(mechanism::ldap(), "alice").with_proof(evidence::PASSWORD, "pencil");
         assert_eq!(verifier.verify(&filed).expect("verified"), Verified::Proven);
         assert_eq!(verifier.mechanism().name(), "ldap");
         assert_eq!(verifier.endpoint(), directory.endpoint);
@@ -425,7 +423,7 @@ mod tests {
             LdapAuthenticator::binding_by_principal(&directory.endpoint, Some("PartnerX"))
                 .with_timeout(Duration::from_secs(2));
         for name in ["PARTNERX\\jane", "jane@PartnerX", "jane"] {
-            let filed = claim(name, "pencil").with_evidence(identify::principal::USER, name);
+            let filed = claim(name, "pencil").with_evidence(evidence::PRINCIPAL_USER, name);
             assert_eq!(
                 verifier.verify(&filed).expect("verified"),
                 Verified::Proven,
@@ -449,7 +447,7 @@ mod tests {
             bare.message
         );
         let filed = claim("PARTNERX\\jane", "pencil")
-            .with_evidence(identify::principal::USER, "mallory@partnerx");
+            .with_evidence(evidence::PRINCIPAL_USER, "mallory@partnerx");
         let other = verifier.verify(&filed).expect_err("refused");
         assert!(
             other.message.contains("'jane@partnerx'")
