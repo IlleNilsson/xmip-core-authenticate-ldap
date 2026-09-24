@@ -32,8 +32,9 @@ pub mod bind;
 
 pub use bind::{BindRequest, BindResponse};
 
-use authenticate::{AuthenticateError, Authenticator, Presented};
+use authenticate::{AuthenticateError, Authenticator};
 use context::Verified;
+use identify::Presented;
 use identify::UserPrincipalName;
 use identify::evidence::{self, PASSWORD};
 use std::io::Write;
