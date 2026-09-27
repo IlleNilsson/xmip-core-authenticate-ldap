@@ -151,26 +151,6 @@ impl LdapAuthenticator {
         })
     }
 
-    /// Refuse a claim whose `principal.user` evidence names another account
-    /// than the one it presents. Evidence is never proof: agreeing with it
-    /// proves nothing, and the bind still decides.
-    fn same_account(&self, presented: &Presented) -> Result<(), AuthenticateError> {
-        let claimed = presented
-            .evidence
-            .iter()
-            .find(|(name, _)| name == evidence::PRINCIPAL_USER)
-            .and_then(|(_, value)| UserPrincipalName::parse(value));
-        match (claimed, self.principal(&presented.value)) {
-            (Some(claimed), Some(read)) if !claimed.is(&read) => {
-                Err(AuthenticateError::new(format!(
-                    "the claim presents '{read}' and its evidence names '{claimed}': not the \
-                     same account"
-                )))
-            }
-            _ => Ok(()),
-        }
-    }
-
     /// The name `username` binds as: the DN the template makes of it, or
     /// its user principal name in canonical form.
     ///
@@ -247,25 +227,13 @@ impl LdapAuthenticator {
     }
 }
 
-/// Whether a claim is one this verifier reads: a bare `username`, or one
-/// the first gate already filed under `ldap`.
-fn reads(mechanism: &Mechanism) -> bool {
-    let name = mechanism.name();
-    name == "username" || name == "ldap"
-}
-
 impl Authenticator for LdapAuthenticator {
     fn mechanism(&self) -> Mechanism {
         mechanism::ldap()
     }
 
     fn verify(&self, presented: &Presented) -> Result<Verified, AuthenticateError> {
-        if !reads(&presented.mechanism) {
-            return Err(AuthenticateError::new(format!(
-                "'{}' is not a claim the LDAP verifier reads: it takes a username",
-                presented.mechanism.name()
-            )));
-        }
+        authenticate::account::user_claim(presented, &self.mechanism())?;
         let password = presented.proof(evidence::PASSWORD).ok_or_else(|| {
             AuthenticateError::new(format!(
                 "no '{PASSWORD}' proof was presented with the username '{}'",
@@ -281,7 +249,9 @@ impl Authenticator for LdapAuthenticator {
             ));
         }
         let name = self.bind_name(&presented.value)?;
-        self.same_account(presented)?;
+        if let Some(read) = self.principal(&presented.value) {
+            authenticate::account::same_account(presented, &read)?;
+        }
         let response = self.bind(&name, password)?;
         match response.result_code {
             bind::SUCCESS => Ok(Verified::Proven),
