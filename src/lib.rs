@@ -38,7 +38,7 @@ use identify::Presented;
 use identify::UserPrincipalName;
 use identify::evidence::{self, PASSWORD};
 use std::io::Write;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 use xcore::{Mechanism, mechanism};
 
@@ -208,19 +208,11 @@ impl LdapAuthenticator {
         ))
     }
 
+    /// A connection to the directory, every address its name resolves to
+    /// tried within the timeout, the timeout on its reads and writes.
     fn connect(&self) -> Result<TcpStream, AuthenticateError> {
-        let addresses = self
-            .endpoint
-            .to_socket_addrs()
-            .map_err(|failure| self.unreachable(&failure))?;
-        let mut last = self.unreachable(&"the name resolves to no address");
-        for address in addresses {
-            match TcpStream::connect_timeout(&address, self.timeout) {
-                Ok(stream) => return Ok(stream),
-                Err(failure) => last = self.unreachable(&failure),
-            }
-        }
-        Err(last)
+        net::connect(self.endpoint.as_str(), Some(self.timeout))
+            .map_err(|failure| self.unreachable(&failure))
     }
 
     /// Bind as `name` with `password` and answer with what the directory
@@ -233,10 +225,6 @@ impl LdapAuthenticator {
     pub fn bind(&self, name: &str, password: &str) -> Result<BindResponse, AuthenticateError> {
         const MESSAGE_ID: i64 = 1;
         let mut stream = self.connect()?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|failure| self.unreachable(&failure))?;
         let request = BindRequest {
             message_id: MESSAGE_ID,
             name: name.to_string(),
