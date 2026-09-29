@@ -117,8 +117,8 @@ impl LdapAuthenticator {
     }
 
     /// Binds at `endpoint` with the user principal name itself as the bind
-    /// name, which Active Directory takes in a simple bind. `PARTNERX\jane`
-    /// and `jane@partnerx` bind alike as `jane@partnerx`, and a bare `jane`
+    /// name, which Active Directory takes in a simple bind. `PARTYX\jane`
+    /// and `jane@partyx` bind alike as `jane@partyx`, and a bare `jane`
     /// is looked up in `default_domain` where one is given.
     #[must_use]
     pub fn binding_by_principal(endpoint: impl Into<String>, default_domain: Option<&str>) -> Self {
@@ -289,7 +289,7 @@ mod tests {
     fn answer(request: &BindRequest) -> BindResponse {
         let id = request.message_id;
         match (request.name.as_str(), request.password.as_str()) {
-            ("uid=alice,ou=people,dc=example,dc=org" | "jane@partnerx", "pencil")
+            ("uid=alice,ou=people,dc=example,dc=org" | "jane@partyx", "pencil")
             | ("uid=Smith\\, John,ou=people,dc=example,dc=org", "pen") => {
                 BindResponse::answering(id, bind::SUCCESS)
             }
@@ -378,10 +378,9 @@ mod tests {
     #[test]
     fn each_spelling_of_one_account_binds_by_the_same_user_principal_name() {
         let directory = directory(3);
-        let verifier =
-            LdapAuthenticator::binding_by_principal(&directory.endpoint, Some("PartnerX"))
-                .with_timeout(Duration::from_secs(2));
-        for name in ["PARTNERX\\jane", "jane@PartnerX", "jane"] {
+        let verifier = LdapAuthenticator::binding_by_principal(&directory.endpoint, Some("PartyX"))
+            .with_timeout(Duration::from_secs(2));
+        for name in ["PARTYX\\jane", "jane@PartyX", "jane"] {
             let filed = claim(name, "pencil").with_evidence(evidence::PRINCIPAL_USER, name);
             assert_eq!(
                 verifier.verify(&filed).expect("verified"),
@@ -389,7 +388,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(directory.finish(), ["jane@partnerx"; 3]);
+        assert_eq!(directory.finish(), ["jane@partyx"; 3]);
     }
 
     #[test]
@@ -405,12 +404,11 @@ mod tests {
             "{}",
             bare.message
         );
-        let filed = claim("PARTNERX\\jane", "pencil")
-            .with_evidence(evidence::PRINCIPAL_USER, "mallory@partnerx");
+        let filed = claim("PARTYX\\jane", "pencil")
+            .with_evidence(evidence::PRINCIPAL_USER, "mallory@partyx");
         let other = verifier.verify(&filed).expect_err("refused");
         assert!(
-            other.message.contains("'jane@partnerx'")
-                && other.message.contains("'mallory@partnerx'"),
+            other.message.contains("'jane@partyx'") && other.message.contains("'mallory@partyx'"),
             "{}",
             other.message
         );
