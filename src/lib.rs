@@ -507,10 +507,7 @@ mod tests {
 
     #[test]
     fn a_directory_that_is_not_there_and_a_template_without_a_name_say_so() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-            listener.local_addr().expect("bound").port()
-        };
+        let port = net::fixture::unheld().port();
         let verifier = LdapAuthenticator::new(format!("127.0.0.1:{port}"), TEMPLATE)
             .expect("a template")
             .with_timeout(Duration::from_millis(500));
