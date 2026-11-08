@@ -17,9 +17,15 @@
 //! unauthenticated bind, which succeeds and proves nothing.
 //!
 //! The endpoint is configuration (ADR-0045) and the tests stand a directory
-//! up in-process over loopback. The bind travels as the connection carries
-//! it, and a simple bind carries the password in the clear: point this at a
-//! directory over a protected path. The mechanism keeps its own name,
+//! up in-process over loopback. A simple bind carries the password as it
+//! is, so it travels only inside TLS, the estate's own ([`channel`]):
+//! `StartTLS` by default ([`start_tls`], RFC 4511 section 4.14), LDAPS with
+//! [`LdapAuthenticator::over_ldaps`], the directory's certificate reaching
+//! the operating system's trust store or the one handed over with
+//! [`LdapAuthenticator::trusting`]. [`LdapAuthenticator::in_the_clear`]
+//! binds without TLS, and only to a directory on loopback: the name must say
+//! so before anything is connected, and the peer must be a loopback address
+//! before anything is sent. The mechanism keeps its own name,
 //! `ldap`, so an Acceptance can say which verifier a Location uses
 //! (ADR-0050, amendment 2026-09-16).
 //!
@@ -29,16 +35,20 @@
 //! `UserPrincipalName` and never parsed here (ADR-0054).
 
 pub mod bind;
+pub mod channel;
+pub mod start_tls;
 
 pub use bind::{BindRequest, BindResponse};
+pub use channel::Protection;
 
 use authenticate::{AuthenticateError, Authenticator};
+use channel::Directory;
 use context::Verified;
 use identify::Presented;
 use identify::UserPrincipalName;
 use identify::evidence::{self, PASSWORD};
 use std::io::Write;
-use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 use xcore::{Mechanism, mechanism};
 
@@ -79,6 +89,8 @@ pub struct LdapAuthenticator {
     endpoint: String,
     naming: Naming,
     timeout: Duration,
+    protection: Protection,
+    trust: Option<Arc<tls::ClientConfig>>,
 }
 
 /// How the presented name becomes the name the bind is made as.
@@ -109,11 +121,19 @@ impl LdapAuthenticator {
                 "the DN template '{template}' has no '{PLACEHOLDER}' in it"
             )));
         }
-        Ok(Self {
-            endpoint: endpoint.into(),
-            naming: Naming::Template(template),
+        Ok(Self::at(endpoint.into(), Naming::Template(template)))
+    }
+
+    /// At `endpoint`, named so, guarded by `StartTLS` against the operating
+    /// system's trust store, with the default timeout.
+    fn at(endpoint: String, naming: Naming) -> Self {
+        Self {
+            endpoint,
+            naming,
             timeout: DEFAULT_TIMEOUT,
-        })
+            protection: Protection::StartTls,
+            trust: None,
+        }
     }
 
     /// Binds at `endpoint` with the user principal name itself as the bind
@@ -122,11 +142,10 @@ impl LdapAuthenticator {
     /// is looked up in `default_domain` where one is given.
     #[must_use]
     pub fn binding_by_principal(endpoint: impl Into<String>, default_domain: Option<&str>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            naming: Naming::Principal(default_domain.map(str::to_string)),
-            timeout: DEFAULT_TIMEOUT,
-        }
+        Self::at(
+            endpoint.into(),
+            Naming::Principal(default_domain.map(str::to_string)),
+        )
     }
 
     /// How long the directory is given to connect, and again to answer.
@@ -134,6 +153,37 @@ impl LdapAuthenticator {
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Speak TLS from the first byte, as an LDAPS port does, rather than
+    /// asking for `StartTLS`.
+    #[must_use]
+    pub const fn over_ldaps(mut self) -> Self {
+        self.protection = Protection::Ldaps;
+        self
+    }
+
+    /// Bind without TLS. Taken only where the directory is this machine:
+    /// anywhere else the bind is refused before the password is sent.
+    #[must_use]
+    pub const fn in_the_clear(mut self) -> Self {
+        self.protection = Protection::Cleartext;
+        self
+    }
+
+    /// The directory's certificate must reach this trust store — a
+    /// Party's own certificate authority — rather than the operating
+    /// system's.
+    #[must_use]
+    pub fn trusting(mut self, config: Arc<tls::ClientConfig>) -> Self {
+        self.trust = Some(config);
+        self
+    }
+
+    /// How the bind's connection is guarded.
+    #[must_use]
+    pub const fn protection(&self) -> Protection {
+        self.protection
     }
 
     /// The directory this binds at.
@@ -181,45 +231,45 @@ impl LdapAuthenticator {
             })
     }
 
-    fn unreachable(&self, failure: &dyn std::fmt::Display) -> AuthenticateError {
-        AuthenticateError::new(format!(
-            "the directory at '{}' cannot be reached: {failure}",
-            self.endpoint
-        ))
-    }
-
-    /// A connection to the directory, every address its name resolves to
-    /// tried within the timeout, the timeout on its reads and writes.
-    fn connect(&self) -> Result<TcpStream, AuthenticateError> {
-        net::connect(self.endpoint.as_str(), Some(self.timeout))
-            .map_err(|failure| self.unreachable(&failure))
-    }
-
     /// Bind as `name` with `password` and answer with what the directory
-    /// said.
+    /// said, on a connection guarded as configured ([`channel`]).
     ///
     /// # Errors
     ///
-    /// The directory cannot be reached, does not answer in time, or answers
+    /// A bind in the clear to a directory not on loopback, a directory that
+    /// cannot be reached or guarded, does not answer in time, or answers
     /// with something that is not the response to this bind.
     pub fn bind(&self, name: &str, password: &str) -> Result<BindResponse, AuthenticateError> {
-        const MESSAGE_ID: i64 = 1;
-        let mut stream = self.connect()?;
+        let directory = Directory {
+            endpoint: &self.endpoint,
+            timeout: self.timeout,
+            protection: self.protection,
+            trust: self.trust.as_ref(),
+        };
+        let message_id = match self.protection {
+            Protection::StartTls => channel::START_TLS_ID + 1,
+            Protection::Ldaps | Protection::Cleartext => 1,
+        };
+        let mut stream = directory.open()?;
         let request = BindRequest {
-            message_id: MESSAGE_ID,
+            message_id,
             name: name.to_string(),
             password: password.to_string(),
         };
-        stream
-            .write_all(&request.encode())
-            .map_err(|failure| self.unreachable(&failure))?;
+        stream.write_all(&request.encode()).map_err(|failure| {
+            AuthenticateError::new(format!(
+                "the directory at '{}' cannot be reached: {failure}",
+                self.endpoint
+            ))
+        })?;
         let response = BindResponse::decode(&bind::read_message(&mut stream)?)?;
         // A directory does not answer an unbind, and one that has already
         // hung up has lost nothing.
-        let _ = stream.write_all(&bind::unbind(MESSAGE_ID + 1));
-        if response.message_id != MESSAGE_ID {
+        let _ = stream.write_all(&bind::unbind(message_id + 1));
+        let _ = stream.flush();
+        if response.message_id != message_id {
             return Err(AuthenticateError::new(format!(
-                "the directory answered message {} and the bind was message {MESSAGE_ID}",
+                "the directory answered message {} and the bind was message {message_id}",
                 response.message_id
             )));
         }
@@ -339,6 +389,7 @@ mod tests {
         fn verifier(&self) -> LdapAuthenticator {
             LdapAuthenticator::new(&self.endpoint, TEMPLATE)
                 .expect("a template")
+                .in_the_clear()
                 .with_timeout(Duration::from_secs(2))
         }
 
@@ -379,6 +430,7 @@ mod tests {
     fn each_spelling_of_one_account_binds_by_the_same_user_principal_name() {
         let directory = directory(3);
         let verifier = LdapAuthenticator::binding_by_principal(&directory.endpoint, Some("PartyX"))
+            .in_the_clear()
             .with_timeout(Duration::from_secs(2));
         for name in ["PARTYX\\jane", "jane@PartyX", "jane"] {
             let filed = claim(name, "pencil").with_evidence(evidence::PRINCIPAL_USER, name);
@@ -510,6 +562,7 @@ mod tests {
         let port = net::fixture::unheld().port();
         let verifier = LdapAuthenticator::new(format!("127.0.0.1:{port}"), TEMPLATE)
             .expect("a template")
+            .in_the_clear()
             .with_timeout(Duration::from_millis(500));
         let failure = verifier
             .verify(&claim("alice", "pencil"))
