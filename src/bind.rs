@@ -12,7 +12,10 @@
 //! Both directions of both messages are here, because the far end a test
 //! stands up reads the request and writes the response.
 
-use asn1::{ENUMERATED, INTEGER, OCTET_STRING, SEQUENCE, expect, integer, read_integer, tlv};
+// LDAP speaks BER: Active Directory writes every length as 0x84 and four
+// bytes, which the DER reader refuses.
+use asn1::ber::expect;
+use asn1::{ENUMERATED, INTEGER, OCTET_STRING, SEQUENCE, integer, read_integer, tlv};
 use authenticate::AuthenticateError;
 use std::fmt;
 use std::io::Read;
@@ -45,7 +48,7 @@ pub const LARGEST: usize = 64 * 1024;
 /// The stream ends or fails first, or the message is larger than
 /// [`LARGEST`].
 pub fn read_message(stream: &mut impl Read) -> Result<Vec<u8>, AuthenticateError> {
-    asn1::read_element(stream, LARGEST).map_err(|failure| {
+    asn1::ber::read_element(stream, LARGEST).map_err(|failure| {
         AuthenticateError::new(format!("the directory's answer: {}", failure.message))
     })
 }
@@ -88,7 +91,7 @@ fn text(contents: &[u8], what: &str) -> Result<String, AuthenticateError> {
 }
 
 /// The envelope: the message id, then the operation under `operation`.
-fn open(message: &[u8], operation: u8) -> Result<(i64, &[u8]), AuthenticateError> {
+pub(crate) fn open(message: &[u8], operation: u8) -> Result<(i64, &[u8]), AuthenticateError> {
     let (envelope, _) = expect(message, SEQUENCE)?;
     let (id, rest) = expect(envelope, INTEGER)?;
     let (body, _) = expect(rest, operation)?;
@@ -187,11 +190,17 @@ impl BindResponse {
     /// The `LDAPMessage` carrying this response, as a directory writes it.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_as(BIND_RESPONSE)
+    }
+
+    /// This `LDAPResult` as the response `operation` tags: a bind's, or an
+    /// extended operation's ([`crate::start_tls`]).
+    pub(crate) fn encode_as(&self, operation: u8) -> Vec<u8> {
         let mut result = tlv(ENUMERATED, &integer(self.result_code));
         result.extend_from_slice(&tlv(OCTET_STRING, self.matched_dn.as_bytes()));
         result.extend_from_slice(&tlv(OCTET_STRING, self.diagnostic.as_bytes()));
         let mut contents = tlv(INTEGER, &integer(self.message_id));
-        contents.extend_from_slice(&tlv(BIND_RESPONSE, &result));
+        contents.extend_from_slice(&tlv(operation, &result));
         tlv(SEQUENCE, &contents)
     }
 
@@ -202,7 +211,13 @@ impl BindResponse {
     ///
     /// Not a bind response, or one cut short.
     pub fn decode(message: &[u8]) -> Result<Self, AuthenticateError> {
-        let (message_id, body) = open(message, BIND_RESPONSE)?;
+        Self::decode_as(message, BIND_RESPONSE)
+    }
+
+    /// Read an `LDAPMessage` as the `LDAPResult` of the response `operation`
+    /// tags; what follows the diagnostic message is not read.
+    pub(crate) fn decode_as(message: &[u8], operation: u8) -> Result<Self, AuthenticateError> {
+        let (message_id, body) = open(message, operation)?;
         let (code, rest) = expect(body, ENUMERATED)?;
         let (matched_dn, rest) = expect(rest, OCTET_STRING)?;
         let (diagnostic, _) = expect(rest, OCTET_STRING)?;
