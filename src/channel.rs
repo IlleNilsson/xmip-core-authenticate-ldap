@@ -132,18 +132,14 @@ impl Directory<'_> {
     }
 
     fn guard(&self, tcp: TcpStream) -> Result<Box<dyn Channel>, AuthenticateError> {
-        let host = self.host();
-        match self.trust {
-            Some(config) => tls::client_with(host, tcp, Arc::clone(config)),
-            None => tls::client(host, tcp),
-        }
-        .map(|guarded| Box::new(guarded) as Box<dyn Channel>)
-        .map_err(|failure| {
-            AuthenticateError::new(format!(
-                "the directory at '{}' cannot be guarded with TLS: {}",
-                self.endpoint, failure.message
-            ))
-        })
+        tls::client_trusting(self.host(), tcp, self.trust)
+            .map(|guarded| Box::new(guarded) as Box<dyn Channel>)
+            .map_err(|failure| {
+                AuthenticateError::new(format!(
+                    "the directory at '{}' cannot be guarded with TLS: {}",
+                    self.endpoint, failure.message
+                ))
+            })
     }
 }
 
