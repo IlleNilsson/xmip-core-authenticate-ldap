@@ -11,7 +11,6 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::sync::Arc;
 use std::time::Duration;
 
 use authenticate::AuthenticateError;
@@ -48,9 +47,9 @@ pub struct Directory<'a> {
     pub timeout: Duration,
     /// How the connection is guarded.
     pub protection: Protection,
-    /// The trust store the directory's certificate must reach; `None` is
-    /// the operating system's.
-    pub trust: Option<&'a Arc<tls::ClientConfig>>,
+    /// What the directory's certificate is checked by: a trust store it
+    /// must reach, the operating system's where none is given.
+    pub settings: &'a tls::ClientSettings,
 }
 
 impl Directory<'_> {
@@ -132,7 +131,8 @@ impl Directory<'_> {
     }
 
     fn guard(&self, tcp: TcpStream) -> Result<Box<dyn Channel>, AuthenticateError> {
-        tls::client_trusting(self.host(), tcp, self.trust)
+        self.settings
+            .client(self.host(), tcp)
             .map(|guarded| Box::new(guarded) as Box<dyn Channel>)
             .map_err(|failure| {
                 AuthenticateError::new(format!(
@@ -161,6 +161,7 @@ mod tests {
     use identify::Presented;
     use identify::evidence;
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::thread;
     use xcore::mechanism;
 
