@@ -90,7 +90,8 @@ pub struct LdapAuthenticator {
     naming: Naming,
     timeout: Duration,
     protection: Protection,
-    trust: Option<Arc<tls::ClientConfig>>,
+    /// What the directory's certificate is checked by.
+    settings: tls::ClientSettings,
 }
 
 /// How the presented name becomes the name the bind is made as.
@@ -132,7 +133,7 @@ impl LdapAuthenticator {
             naming,
             timeout: DEFAULT_TIMEOUT,
             protection: Protection::StartTls,
-            trust: None,
+            settings: tls::ClientSettings::native(),
         }
     }
 
@@ -176,7 +177,7 @@ impl LdapAuthenticator {
     /// system's.
     #[must_use]
     pub fn trusting(mut self, config: Arc<tls::ClientConfig>) -> Self {
-        self.trust = Some(config);
+        self.settings = tls::ClientSettings::trusting(config);
         self
     }
 
@@ -244,7 +245,7 @@ impl LdapAuthenticator {
             endpoint: &self.endpoint,
             timeout: self.timeout,
             protection: self.protection,
-            trust: self.trust.as_ref(),
+            settings: &self.settings,
         };
         let message_id = match self.protection {
             Protection::StartTls => channel::START_TLS_ID + 1,
