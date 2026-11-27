@@ -1,11 +1,11 @@
 [package]
 name = "xmip-core-authenticate-ldap"
-version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 repository = "https://github.com/IlleNilsson/xmip-core-authenticate-ldap"
 description = "Authenticate by LDAP: proves a username and password by a simple bind at the directory, RFC 4511 inside TLS: StartTLS or LDAPS. A xmip-core-authenticate technology."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -35,13 +35,5 @@ rcgen = "0.14"
 # at or binds later (`net::fixture::unheld`).
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", features = ["test-support"] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-too_many_lines = "warn"
-pedantic = { level = "warn", priority = -1 }
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-unwrap_used = "warn"
-expect_used = "allow"
+[lints]
+workspace = true
